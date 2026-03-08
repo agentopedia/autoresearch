@@ -20,6 +20,14 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock, exclu
 
 **Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
+> No access to Hugging Face from your environment? You can generate tiny local fallback shards and a tokenizer with:
+>
+> ```bash
+> uv run prepare.py --offline-fallback force --num-shards 2
+> ```
+>
+> This is intended for smoke tests and CPU/offline bring-up (not benchmark-quality training data).
+
 ```bash
 
 # 1. Install uv project manager (if you don't already have it)
