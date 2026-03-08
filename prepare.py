@@ -5,6 +5,7 @@ Downloads data shards and trains a BPE tokenizer.
 Usage:
     python prepare.py                  # full prep (download + tokenizer)
     python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py --offline-fallback force --num-shards 2  # offline/local fallback
 
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
@@ -18,6 +19,7 @@ import pickle
 from multiprocessing import Pool
 
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
@@ -111,6 +113,53 @@ def download_data(num_shards, download_workers=8):
 
     ok = sum(1 for r in results if r)
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+
+
+
+def _load_local_fallback_documents():
+    """Build a small local corpus from repository text files for offline fallback."""
+    docs = []
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    fallback_files = ["README.md", "program.md", "train.py", "prepare.py"]
+    for name in fallback_files:
+        path = os.path.join(repo_root, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            docs.append(text)
+            docs.append(f"File: {name}\n{text}")
+    if not docs:
+        docs = [
+            "Autoresearch offline fallback sample document.",
+            "This shard exists so tokenizer training can run without network access.",
+        ]
+    return docs
+
+
+def create_offline_fallback_data(num_train_shards=1):
+    """Create tiny local parquet shards when remote data download is unavailable."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    docs = _load_local_fallback_documents()
+
+    train_docs = docs * 128
+    val_docs = list(reversed(docs)) * 64
+
+    created = 0
+    for idx in range(max(1, num_train_shards)):
+        path = os.path.join(DATA_DIR, f"shard_{idx:05d}.parquet")
+        table = pa.table({"text": train_docs})
+        pq.write_table(table, path)
+        created += 1
+
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    val_table = pa.table({"text": val_docs})
+    pq.write_table(val_table, val_path)
+    created += 1
+
+    print(f"Data: wrote {created} offline fallback shards to {DATA_DIR}")
+
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -382,6 +431,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument("--offline-fallback", choices=["auto", "force", "off"], default="auto",
+                        help="Fallback shard strategy when remote downloads are unavailable")
     args = parser.parse_args()
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
@@ -390,7 +441,14 @@ if __name__ == "__main__":
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    if args.offline_fallback == "force":
+        create_offline_fallback_data(num_train_shards=max(1, min(num_shards, 2)))
+    else:
+        download_data(num_shards, download_workers=args.download_workers)
+        parquet_files = list_parquet_files() if os.path.isdir(DATA_DIR) else []
+        if args.offline_fallback == "auto" and len(parquet_files) < 2:
+            print("Data: insufficient shards downloaded; using offline fallback shards.")
+            create_offline_fallback_data(num_train_shards=max(1, min(num_shards, 2)))
     print()
 
     # Step 2: Train tokenizer
