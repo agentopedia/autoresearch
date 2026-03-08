@@ -5,6 +5,7 @@ Downloads data shards and trains a BPE tokenizer.
 Usage:
     python prepare.py                  # full prep (download + tokenizer)
     python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py --offline-fallback force --num-shards 2  # offline/local fallback
 
 Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
@@ -18,6 +19,7 @@ import pickle
 from multiprocessing import Pool
 
 import requests
+import pyarrow as pa
 import pyarrow.parquet as pq
 import rustbpe
 import tiktoken
@@ -111,6 +113,53 @@ def download_data(num_shards, download_workers=8):
 
     ok = sum(1 for r in results if r)
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+
+
+
+def _load_local_fallback_documents():
+    """Build a small local corpus from repository text files for offline fallback."""
+    docs = []
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    fallback_files = ["README.md", "program.md", "train.py", "prepare.py"]
+    for name in fallback_files:
+        path = os.path.join(repo_root, name)
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            docs.append(text)
+            docs.append(f"File: {name}\n{text}")
+    if not docs:
+        docs = [
+            "Autoresearch offline fallback sample document.",
+            "This shard exists so tokenizer training can run without network access.",
+        ]
+    return docs
+
+
+def create_offline_fallback_data(num_train_shards=1):
+    """Create tiny local parquet shards when remote data download is unavailable."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    docs = _load_local_fallback_documents()
+
+    train_docs = docs * 128
+    val_docs = list(reversed(docs)) * 64
+
+    created = 0
+    for idx in range(max(1, num_train_shards)):
+        path = os.path.join(DATA_DIR, f"shard_{idx:05d}.parquet")
+        table = pa.table({"text": train_docs})
+        pq.write_table(table, path)
+        created += 1
+
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    val_table = pa.table({"text": val_docs})
+    pq.write_table(val_table, val_path)
+    created += 1
+
+    print(f"Data: wrote {created} offline fallback shards to {DATA_DIR}")
+
 
 # ---------------------------------------------------------------------------
 # Tokenizer training
@@ -272,7 +321,7 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -294,12 +343,20 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    pin_memory = device.startswith("cuda")
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=pin_memory)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+
+    if device.startswith("cuda"):
+        gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+        inputs = gpu_buffer[:B * T].view(B, T)
+        targets = gpu_buffer[B * T:].view(B, T)
+    else:
+        inputs = cpu_inputs
+        targets = cpu_targets
 
     while True:
         for row_idx in range(B):
@@ -332,7 +389,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if device.startswith("cuda"):
+            gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -340,7 +398,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, device=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -348,8 +406,10 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    token_bytes = get_token_bytes(device=device)
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device)
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
@@ -371,6 +431,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser.add_argument("--offline-fallback", choices=["auto", "force", "off"], default="auto",
+                        help="Fallback shard strategy when remote downloads are unavailable")
     args = parser.parse_args()
 
     num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
@@ -379,7 +441,14 @@ if __name__ == "__main__":
     print()
 
     # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    if args.offline_fallback == "force":
+        create_offline_fallback_data(num_train_shards=max(1, min(num_shards, 2)))
+    else:
+        download_data(num_shards, download_workers=args.download_workers)
+        parquet_files = list_parquet_files() if os.path.isdir(DATA_DIR) else []
+        if args.offline_fallback == "auto" and len(parquet_files) < 2:
+            print("Data: insufficient shards downloaded; using offline fallback shards.")
+            create_offline_fallback_data(num_train_shards=max(1, min(num_shards, 2)))
     print()
 
     # Step 2: Train tokenizer
